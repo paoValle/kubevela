@@ -41,6 +41,7 @@ import (
 	wfexpressions "github.com/kubevela/workflow/pkg/expressions"
 	wfbuiltin "github.com/kubevela/workflow/pkg/tasks/builtin"
 
+	"github.com/oam-dev/kubevela/apis/core.oam.dev/common"
 	"github.com/oam-dev/kubevela/apis/core.oam.dev/v1beta1"
 	"github.com/oam-dev/kubevela/apis/types"
 	"github.com/oam-dev/kubevela/pkg/appfile"
@@ -721,6 +722,156 @@ func traitConflictRuleMatches(rule string, target *v1beta1.TraitDefinition) bool
 	}
 }
 
+// ValidateTraitAppliesTo validates TraitDefinition.spec.appliesToWorkloads for
+// traits attached to a component, restoring the check the v1alpha2
+// ApplicationConfiguration webhook had before that API was removed. Like
+// ValidateTraitConflicts it stays outside ValidateComponents so it still runs
+// when sharding skips component schematic validation.
+func (h *ValidatingHandler) ValidateTraitAppliesTo(ctx context.Context, app *v1beta1.Application) field.ErrorList {
+	var errs field.ErrorList
+	defCtx := oamutil.SetNamespaceInCtx(ctx, app.Namespace)
+
+	// Each component type and trait type is resolved once: both are shared by
+	// every component/trait that names them.
+	workloadCache := make(map[string]string)
+	workloadOf := func(compType string) (string, error) {
+		if workload, ok := workloadCache[compType]; ok {
+			return workload, nil
+		}
+		cd := &v1beta1.ComponentDefinition{}
+		if err := oamutil.GetCapabilityDefinition(defCtx, h.Client, cd, compType, app.GetAnnotations()); err != nil {
+			if errors.IsNotFound(err) {
+				// Existence is validated elsewhere; missing defs are skipped here.
+				workloadCache[compType] = ""
+				return "", nil
+			}
+			return "", err
+		}
+		// Workload.Type is the workload's resource.group (deployments.apps), the
+		// form appliesToWorkloads rules use: the ComponentDefinition mutating
+		// webhook fills it from spec.workload.definition and its validating
+		// webhook requires the two to agree. A definition written before that
+		// webhook ran only carries the GVK, so map it on demand. Empty or
+		// autodetect means the component has no single workload kind
+		// (k8s-objects, ref-objects) and a trait cannot be restricted against it.
+		workload := cd.Spec.Workload.Type
+		if workload == "" || workload == types.AutoDetectWorkloadDefinition {
+			workload = h.workloadFromGVK(cd.Spec.Workload.Definition)
+		}
+		workloadCache[compType] = workload
+		return workload, nil
+	}
+
+	traitCache := make(map[string]*v1beta1.TraitDefinition)
+	traitOf := func(traitType string) (*v1beta1.TraitDefinition, error) {
+		if def, ok := traitCache[traitType]; ok {
+			return def, nil
+		}
+		def := &v1beta1.TraitDefinition{}
+		if err := oamutil.GetCapabilityDefinition(defCtx, h.Client, def, traitType, app.GetAnnotations()); err != nil {
+			if errors.IsNotFound(err) {
+				// Existence is validated elsewhere; missing defs are skipped here.
+				traitCache[traitType] = nil
+				return nil, nil
+			}
+			return nil, err
+		}
+		traitCache[traitType] = def
+		return def, nil
+	}
+
+	for compIdx, comp := range app.Spec.Components {
+		if len(comp.Traits) == 0 {
+			continue
+		}
+		compType, err := appfile.ResolveModuleType(defCtx, h.Client, comp.Type, types.TypeComponentDefinition)
+		if err != nil {
+			// Unresolvable types are reported where types are validated, as in
+			// ValidateTraitConflicts; a module component renders its own Application.
+			continue
+		}
+		workload, err := workloadOf(compType)
+		if err != nil {
+			// The workload comes from the ComponentDefinition, not from the
+			// Application's author, so an API/transient failure here would reject
+			// an Application nobody wrote wrongly: log and let it through.
+			klog.Errorf("Failed to resolve the workload of component type %q for appliesToWorkloads validation: %v", comp.Type, err)
+			continue
+		}
+		if workload == "" {
+			continue
+		}
+		for traitIdx, trait := range comp.Traits {
+			traitType, err := appfile.ResolveModuleType(defCtx, h.Client, trait.Type, types.TypeTrait)
+			if err != nil {
+				continue
+			}
+			def, err := traitOf(traitType)
+			if err != nil {
+				// Fail closed so unresolved definitions cannot bypass the restriction,
+				// as in ValidateTraitConflicts.
+				klog.Errorf("Failed to resolve TraitDefinition %q for appliesToWorkloads validation: %v", trait.Type, err)
+				errs = append(errs, field.InternalError(
+					field.NewPath("spec", "components").Index(compIdx).Child("traits").Index(traitIdx).Child("type"),
+					err))
+				continue
+			}
+			if def == nil || traitAppliesToWorkload(def.Spec.AppliesToWorkloads, workload) {
+				continue
+			}
+			errs = append(errs, field.Invalid(
+				field.NewPath("spec", "components").Index(compIdx).Child("traits").Index(traitIdx).Child("type"),
+				def.Name,
+				fmt.Sprintf("trait %q cannot apply to workload %q of component %q (appliable: %q)", def.Name, workload, comp.Name, def.Spec.AppliesToWorkloads)))
+		}
+	}
+
+	return errs
+}
+
+// workloadFromGVK maps a workload GVK to its resource.group name
+// (apps/v1 Deployment -> deployments.apps). Empty when the mapper cannot say:
+// the GVK comes from the ComponentDefinition, not from the Application's
+// author, so an unknown kind must not reject the Application.
+func (h *ValidatingHandler) workloadFromGVK(gvk common.WorkloadGVK) string {
+	if gvk.Kind == "" {
+		return ""
+	}
+	mapper := h.Client.RESTMapper()
+	if mapper == nil {
+		return ""
+	}
+	ref, err := oamutil.ConvertWorkloadGVK2Definition(mapper, gvk)
+	if err != nil {
+		klog.Errorf("Failed to map workload %s, Kind=%s to a resource name: %v", gvk.APIVersion, gvk.Kind, err)
+		return ""
+	}
+	return ref.Name
+}
+
+// traitAppliesToWorkload reports whether rules allow a trait on the workload
+// kind workloadType, given as resource.group (deployments.apps). The rule forms
+// are the documented ones: "*", "*.<group>" and the exact resource.group. An
+// empty rule list allows every workload.
+func traitAppliesToWorkload(rules []string, workloadType string) bool {
+	if len(rules) == 0 {
+		return true
+	}
+	group := ""
+	if dot := strings.Index(workloadType, "."); dot >= 0 {
+		group = workloadType[dot+1:]
+	}
+	for _, rule := range rules {
+		if rule == "*" || rule == workloadType {
+			return true
+		}
+		if group != "" && strings.HasPrefix(rule, "*.") && rule[2:] == group {
+			return true
+		}
+	}
+	return false
+}
+
 // ValidateCreate validates the Application on creation.
 //
 // Validation runs in two phases, and the second is not attempted when the first
@@ -770,6 +921,7 @@ func (h *ValidatingHandler) validateSoundness(ctx context.Context, app, oldApp *
 	errs = append(errs, h.ValidateWorkflow(ctx, app)...)
 	errs = append(errs, h.ValidateComponentNames(ctx, app)...)
 	errs = append(errs, h.ValidateTraitConflicts(ctx, app)...)
+	errs = append(errs, h.ValidateTraitAppliesTo(ctx, app)...)
 	return errs, warnings
 }
 
